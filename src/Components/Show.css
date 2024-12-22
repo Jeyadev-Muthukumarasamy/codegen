@@ -1,0 +1,3 @@
+.resizable:hover {
+  cursor: col-resize; /* Adjust for horizontal or vertical resizing */
+}
