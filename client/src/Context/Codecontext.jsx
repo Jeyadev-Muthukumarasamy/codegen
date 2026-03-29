@@ -6,10 +6,19 @@ const CodeGeneratorContext = createContext();
 export const CodeGeneratorProvider = ({ children }) => {
   const [prompt, setPrompt] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [code, setCode] = useState(""); // Initialize code as empty string
-  const [messages, setMessages] = useState([]); // Initialize messages as an empty array
+  const [code, setCode] = useState(() => {
+    return sessionStorage.getItem("codegen_code") || "";
+  });
+  const [messages, setMessages] = useState(() => {
+    try {
+      const saved = sessionStorage.getItem("codegen_messages");
+      return saved ? JSON.parse(saved) : [];
+    } catch { return []; }
+  });
   const [data, setData] = useState(null);
-  const [projectName, setProjectName] = useState("");
+  const [projectName, setProjectName] = useState(() => {
+    return sessionStorage.getItem("codegen_projectName") || "";
+  });
 
   // Function to handle code generation
   const generateCode = async () => {
@@ -38,41 +47,61 @@ export const CodeGeneratorProvider = ({ children }) => {
         );
       }
 
-      const responseData = await response.json();
-      console.log("Response data:", responseData);
+      const contentType = response.headers.get("content-type");
 
-      // Update projectName state
-      if (responseData.projectName) {
-        setProjectName(responseData.projectName);
-        console.log("Updated project name:", responseData.projectName);
+      // Handle cached (non-streamed) JSON response
+      if (contentType && contentType.includes("application/json")) {
+        const responseData = await response.json();
+        if (responseData.projectName) setProjectName(responseData.projectName);
+        if (responseData.code) setCode(responseData.code);
+        if (responseData.frontendMessage) {
+          setMessages((prev) => [
+            ...(Array.isArray(prev) ? prev : []),
+            { text: responseData.frontendMessage, sender: "bot" },
+          ]);
+        }
+        return;
       }
 
-      // Ensure the response contains the necessary fields
-      if (responseData && responseData.message) {
-        const { frontendMessage, code } = responseData.message;
+      // Handle SSE stream
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
 
-        // Update the code state with the response
-        setCode(code);
+      // Add a placeholder bot message while generating
+      setMessages((prev) => [
+        ...(Array.isArray(prev) ? prev : []),
+        { text: "Generating your code...", sender: "bot" },
+      ]);
 
-        // Append the bot's response (frontendMessage) to messages
-        setMessages((prevMessages) => [
-          ...(Array.isArray(prevMessages) ? prevMessages : []),
-          { text: frontendMessage, sender: "bot" },
-        ]);
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-        console.log("Generated code:", code);
-        console.log("Frontend message:", frontendMessage);
-      } else {
-        console.error("Invalid response format:", responseData);
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n\n");
+        buffer = lines.pop() || "";
 
-        // Handle invalid response
-        setMessages((prevMessages) => [
-          ...(Array.isArray(prevMessages) ? prevMessages : []),
-          {
-            text: "Invalid response from the server.",
-            sender: "bot",
-          },
-        ]);
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const parsed = JSON.parse(line.slice(6));
+
+          if (parsed.type === "done") {
+            // Set final structured data - only show message, not code
+            if (parsed.projectName) setProjectName(parsed.projectName);
+            if (parsed.code) setCode(parsed.code);
+            setMessages((prev) => {
+              const updated = [...prev];
+              updated[updated.length - 1] = {
+                text: parsed.frontendMessage || "Code generated successfully!",
+                sender: "bot",
+              };
+              return updated;
+            });
+          } else if (parsed.type === "error") {
+            throw new Error(parsed.error);
+          }
+        }
       }
     } catch (error) {
       console.error("Error generating code:", error);
@@ -90,17 +119,18 @@ export const CodeGeneratorProvider = ({ children }) => {
     }
   };
 
-  // Debugging: Log updated projectName when it changes
+  // Persist state to sessionStorage
   useEffect(() => {
-    if (projectName) {
-      console.log("Project name has been updated:", projectName);
-    }
-  }, [projectName]);
+    sessionStorage.setItem("codegen_code", code);
+  }, [code]);
 
-  // Debugging: Log updated messages
   useEffect(() => {
-    console.log("Messages updated:", messages);
+    sessionStorage.setItem("codegen_messages", JSON.stringify(messages));
   }, [messages]);
+
+  useEffect(() => {
+    sessionStorage.setItem("codegen_projectName", projectName);
+  }, [projectName]);
 
   return (
     <CodeGeneratorContext.Provider

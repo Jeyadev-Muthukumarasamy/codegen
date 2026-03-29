@@ -6,7 +6,7 @@ import { CohereClient } from 'cohere-ai';
 import { LRUCache } from 'lru-cache';
 import { router } from './api/api.js';
 import bodyParser from 'body-parser';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { Mistral } from '@mistralai/mistralai';
 
 dotenv.config();
 
@@ -17,10 +17,9 @@ app.use(cors());
 app.use(express.json());
 app.use(bodyParser.json()); 
 dotenv.config();
-const api_key = process.env.GOOGLE_CLOUD_API_KEY;
-console.log(api_key,"hi")
+const mistral = new Mistral({ apiKey: process.env.MISTRAL_API_KEY });
 
-mongoose.connect('mongodb+srv://jeydev007:jeydev007@cluster0.hzfgg.mongodb.net/')
+mongoose.connect(process.env.MONGODB_URI)
     .then(() => console.log('Connected to MongoDB Atlas'))    
     .catch(err => {
         console.error('Connection error:', err);
@@ -43,7 +42,7 @@ mongoose.connect('mongodb+srv://jeydev007:jeydev007@cluster0.hzfgg.mongodb.net/'
     - Include a **semantic, structured, and maintainable layout**.
     - Provide the output in the following structure:
       - Project Name: Suggested Project Name
-      - Description: <Brief explanation of the generated code>.give description such that it is not understabdanle to no  technicable person
+      - Description: <Brief explanation of the generated code in plain text only, no markdown formatting, no asterisks, no bullet points, no headers. Write it as simple sentences understandable to a non-technical person.>
       - Code: \`\`\`html
       <Generated HTML code here>
       \`\`\`
@@ -68,6 +67,22 @@ mongoose.connect('mongodb+srv://jeydev007:jeydev007@cluster0.hzfgg.mongodb.net/'
       }
     };
     
+    const stripMarkdown = (text) => {
+      return text
+        .replace(/#{1,6}\s+/g, '')           // headers
+        .replace(/\*\*([^*]+)\*\*/g, '$1')   // bold
+        .replace(/\*([^*]+)\*/g, '$1')       // italic
+        .replace(/__([^_]+)__/g, '$1')       // bold underscores
+        .replace(/_([^_]+)_/g, '$1')         // italic underscores
+        .replace(/~~([^~]+)~~/g, '$1')       // strikethrough
+        .replace(/`([^`]+)`/g, '$1')         // inline code
+        .replace(/^\s*[-*+]\s+/gm, '')       // bullet points
+        .replace(/^\s*\d+\.\s+/gm, '')       // numbered lists
+        .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1') // links
+        .replace(/\n{3,}/g, '\n\n')          // excessive newlines
+        .trim();
+    };
+
     const parseFrontendResponse = (responseText) => {
       // Extract project name
       const projectNameMatch = responseText.match(/Project Name:\s*([^\n]+)/);
@@ -83,60 +98,54 @@ mongoose.connect('mongodb+srv://jeydev007:jeydev007@cluster0.hzfgg.mongodb.net/'
     
       return {
         projectName,
-        message,
+        message: stripMarkdown(message),
         code
       };
     };
     
-    // Modified response handling
+    // Modified response handling with streaming
     app.post("/cohere", async (req, res) => {
       try {
         const { prompt } = req.body;
         if (!prompt) return res.status(400).json({ error: 'Prompt is required' });
-    
+
         const cacheKey = `response_${prompt}`;
-        if (cache.has(cacheKey)) return res.status(200).json({ message: cache.get(cacheKey) });
-    
-        const genAI = new GoogleGenerativeAI(api_key);
-        const model = genAI.getGenerativeModel({
-          model: 'gemini-1.5-pro',
-          generationConfig: {
-            temperature: 0.3,
-            topK: 20,
-            topP: 0.9,
-            maxOutputTokens: 8192,
+        if (cache.has(cacheKey)) return res.status(200).json(cache.get(cacheKey));
+
+        // Set SSE headers
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.flushHeaders();
+
+        const stream = await mistral.chat.stream({
+          model: 'mistral-large-latest',
+          messages: [{ role: 'user', content: generateFrontendPrompt(prompt) }],
+          temperature: 0.3,
+          topP: 0.9,
+          maxTokens: 8192,
+        });
+
+        let fullText = '';
+        for await (const event of stream) {
+          const chunk = event.data.choices[0]?.delta?.content || '';
+          if (chunk) {
+            fullText += chunk;
+            res.write(`data: ${JSON.stringify({ type: 'chunk', content: chunk })}\n\n`);
           }
-        });
-    
-        const chat = model.startChat({
-          history: [],
-          generationConfig: {
-            temperature: 0.3,
-            topK: 20,
-            topP: 0.9,
-            maxOutputTokens: 8192,
-          },
-          tools: [{ codeExecution: {} }],
-        });
-    
-        const frontendResult = await fetchWithRetries(() =>
-          chat.sendMessage(generateFrontendPrompt(prompt))
-        );
-    
-        const { projectName, message: frontendMessage, code: frontendCode } = parseFrontendResponse(frontendResult.response.text());
-        
-        const response = {
-          projectName,
-          frontendMessage,
-          code: frontendCode,
-        };
-    
-        cache.set(cacheKey, response);
-        res.status(200).json(response);
-        
+        }
+
+        // Parse and send final structured result
+        const { projectName, message: frontendMessage, code: frontendCode } = parseFrontendResponse(fullText);
+        const finalData = { projectName, frontendMessage, code: frontendCode };
+        cache.set(cacheKey, finalData);
+        res.write(`data: ${JSON.stringify({ type: 'done', ...finalData })}\n\n`);
+        res.end();
+
       } catch (error) {
         console.error("Error generating code:", error);
-        res.status(500).json({ error: error.message || "An error occurred during code generation." });
+        res.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
+        res.end();
       }
     });
     
@@ -149,11 +158,6 @@ app.post('/update', async (req, res) => {
       return res.status(400).json({ error: 'User prompt and existing code are required' });
     }
 
-  
-
-    const genAI = new GoogleGenerativeAI(api_key);
-    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-pro' });
-
     const updatePrompt = `
     You are a senior frontend developer focused on building high-quality, modern web pages. Your task is to improve the existing codebase based on user requests.
 
@@ -164,8 +168,8 @@ app.post('/update', async (req, res) => {
     ---CODE---
     [Your HTML/CSS/JS code here]
     ---MESSAGE---
-    [Brief explanation of changes.but it should be understandable to non technical preson.remember you are speaking with non technical person]
-   
+    [Brief explanation of changes in plain text only. No markdown, no asterisks, no bullet points, no headers, no numbered lists. Write simple sentences understandable to a non-technical person.]
+
     2. Only ask clarifying questions if absolutely necessary for critical functionality
     3. Use Tailwind CSS for all styling
     4. Ensure mobile-first, responsive design
@@ -181,53 +185,61 @@ app.post('/update', async (req, res) => {
     ${aiMessage}
     `;
 
-    const chat = model.startChat({
-      history: [],
-      generationConfig: {
-        temperature: 0.3,
-        topK: 20,
-        topP: 0.9,
-        maxOutputTokens: 8192,
-      },
-      tools: [{ codeExecution: {} }]
+    // Set SSE headers
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    const stream = await mistral.chat.stream({
+      model: 'mistral-large-latest',
+      messages: [{ role: 'user', content: updatePrompt }],
+      temperature: 0.3,
+      topP: 0.9,
+      maxTokens: 8192,
     });
 
-    const result = await chat.sendMessage(updatePrompt);
-    const responseContent = result.response.candidates[0].content;
-
-    let contentText = '';
-    if (typeof responseContent === 'object' && responseContent.parts) {
-      contentText = responseContent.parts.map(part => part.text).join('');
-    } else {
-      contentText = responseContent;
+    let fullText = '';
+    for await (const event of stream) {
+      const chunk = event.data.choices[0]?.delta?.content || '';
+      if (chunk) {
+        fullText += chunk;
+        res.write(`data: ${JSON.stringify({ type: 'chunk', content: chunk })}\n\n`);
+      }
     }
 
-    // Extract code and message using the new format
-    const sections = contentText.split('---MESSAGE---');
+    // Parse final result
+    const sections = fullText.split('---MESSAGE---');
     let code = '';
     let message = '';
 
     if (sections.length >= 2) {
       code = sections[0].replace('---CODE---', '').trim();
+      // Strip any remaining backtick wrappers from code
+      const codeBlockMatch = code.match(/```(?:html|javascript|css)?([\s\S]*?)```/);
+      if (codeBlockMatch) code = codeBlockMatch[1].trim();
       message = sections[1].trim();
     } else {
-      // Fallback to looking for code blocks if new format isn't found
-      const codeMatch = contentText.match(/```(?:html|javascript|css)?([\s\S]*?)```/);
+      const codeMatch = fullText.match(/```(?:html|javascript|css)?([\s\S]*?)```/);
       code = codeMatch ? codeMatch[1].trim() : '';
-      message = contentText.replace(/```(?:html|javascript|css)?[\s\S]*?```/g, '').trim();
+      message = fullText.replace(/```(?:html|javascript|css)?[\s\S]*?```/g, '').trim();
     }
 
-    return res.status(200).json({
-      code: code,
-      frontendMessage: message,
-    });
+    // Clean message: remove any leftover markers, code artifacts, and markdown
+    message = stripMarkdown(
+      message
+        .replace(/---CODE---/g, '')
+        .replace(/```[\s\S]*?```/g, '')
+        .trim()
+    );
+
+    res.write(`data: ${JSON.stringify({ type: 'done', code, frontendMessage: message })}\n\n`);
+    res.end();
 
   } catch (error) {
     console.error("Error in update-code handler:", error);
-    return res.status(500).json({
-      error: 'An error occurred',
-      details: error.message
-    });
+    res.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
+    res.end();
   }
 });
 

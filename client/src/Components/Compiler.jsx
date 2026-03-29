@@ -141,38 +141,76 @@ const Compiler = () => {
 
   const handleUpdate = async () => {
     if (!input.trim() || loading) return;
-    
+
     try {
       setLoading(true);
       setMessages(prev => [...prev, { text: input, sender: 'user' }]);
-      
-      const response = await axios.post('http://localhost:3001/update', {
-        inputMessage: input,
-        existingCode: finalCodeValue,
-        aiMessage: messages[messages.length - 1]?.text
+
+      const response = await fetch('http://localhost:3001/update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          inputMessage: input,
+          existingCode: finalCodeValue,
+          aiMessage: messages[messages.length - 1]?.text
+        }),
       });
-  
-      if (response.data.code) {
-        const formattedCode = beautify.html(response.data.code, { 
-          indent_size: 2, 
-          preserve_newlines: true 
-        });
-        await typeCode(formattedCode);
-        setCode(formattedCode);
+
+      // Add placeholder bot message while generating
+      setMessages(prev => [...prev, { text: 'Updating your code...', sender: 'bot' }]);
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const parsed = JSON.parse(line.slice(6));
+
+          if (parsed.type === 'done') {
+            if (parsed.code) {
+              const formattedCode = beautify.html(parsed.code, {
+                indent_size: 2,
+                preserve_newlines: true
+              });
+              setEditorValue(formattedCode);
+              setFinalCodeValue(formattedCode);
+              setCode(formattedCode);
+            }
+            setMessages(prev => {
+              const updated = [...prev];
+              updated[updated.length - 1] = {
+                text: parsed.frontendMessage || 'Code updated successfully!',
+                sender: 'bot',
+              };
+              return updated;
+            });
+          } else if (parsed.type === 'error') {
+            setMessages(prev => {
+              const updated = [...prev];
+              updated[updated.length - 1] = {
+                text: 'Failed to update code. Please try again.',
+                sender: 'bot',
+              };
+              return updated;
+            });
+          }
+        }
       }
-  
-      if (response.data.frontendMessage) {
-        setMessages(prev => [...prev, { 
-          text: response.data.frontendMessage, 
-          sender: 'bot' 
-        }]);
-      }
-      
+
       setInput('');
     } catch (error) {
-      setMessages(prev => [...prev, { 
-        text: 'Failed to update code. Please try again.', 
-        sender: 'bot' 
+      setMessages(prev => [...prev, {
+        text: 'Failed to update code. Please try again.',
+        sender: 'bot'
       }]);
     } finally {
       setLoading(false);
